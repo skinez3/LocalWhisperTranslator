@@ -1,7 +1,23 @@
 import { pipeline, env } from './transformers.js';
 
 env.backends.onnx.wasm.numThreads = 1;
+// Load ONNX Runtime files from the extension
+env.backends.onnx.wasm.wasmPaths = chrome.runtime.getURL('');
+// Prefer the discrete GPU on laptops
+if (env.backends.onnx.webgpu) env.backends.onnx.webgpu.powerPreference = 'high-performance';
 env.allowLocalModels = false;
+
+const SAMPLE_RATE = 16000;
+const WHISPER_WINDOW = SAMPLE_RATE * 30;
+
+const MODEL_IDS = {
+    tiny: 'onnx-community/whisper-tiny',
+    base: 'onnx-community/whisper-base',
+    small: 'onnx-community/whisper-small',
+    turbo: 'onnx-community/whisper-large-v3-turbo',
+    // Old setting, turbo is faster and more accurate than medium
+    medium: 'onnx-community/whisper-large-v3-turbo'
+};
 
 let transcriber = null;
 let isModelLoading = false;
@@ -19,14 +35,7 @@ let currentSettings = {
     targetLang: 'ru'
 };
 
-// Volume level of an audio chunk
-function getRMS(pcmData) {
-    let sum = 0;
-    for (let i = 0; i < pcmData.length; i++) sum += pcmData[i] * pcmData[i];
-    return Math.sqrt(sum / pcmData.length);
-}
-
-// Unload and reload model (e.g. size changed)
+// Unload and reload model
 async function reloadModel() {
     if (isModelLoading) return;
 
@@ -42,19 +51,47 @@ async function reloadModel() {
     await initWhisper();
 }
 
+// fp16 weights need the shader-f16 GPU feature
+async function isFp16Supported() {
+    try {
+        const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+        return !!adapter && adapter.features.has('shader-f16');
+    } catch (e) {
+        return false;
+    }
+}
+
 // Load Whisper model on WebGPU
 async function initWhisper() {
     if (transcriber) return transcriber;
     if (isModelLoading) return null;
 
     isModelLoading = true;
-    console.log(`Loading whisper-${currentSettings.modelSize} on WebGPU...`);
+    const modelId = MODEL_IDS[currentSettings.modelSize] || MODEL_IDS.small;
+    console.log(`Loading ${modelId} on WebGPU...`);
 
     try {
-        transcriber = await pipeline('automatic-speech-recognition', `Xenova/whisper-${currentSettings.modelSize}`, {
+        // v2 silently ignores device and runs on CPU
+        if (env.version.startsWith('2.')) {
+            throw new Error(`transformers.js ${env.version} has no WebGPU support, update to v3`);
+        }
+
+        const fp16 = await isFp16Supported();
+        transcriber = await pipeline('automatic-speech-recognition', modelId, {
             device: 'webgpu',
-            dtype: 'fp16'
+            dtype: {
+                // Encoder is sensitive to quantization, q4 decoder generates tokens fastest
+                encoder_model: fp16 ? 'fp16' : 'fp32',
+                decoder_model_merged: 'q4'
+            }
         });
+
+        // Compile GPU shaders now so the first phrase isn't delayed
+        await transcriber(new Float32Array(SAMPLE_RATE), {
+            language: currentSettings.sourceLang,
+            task: 'transcribe',
+            max_new_tokens: 4
+        }).catch(e => console.warn('Warm-up error:', e));
 
         console.log('Whisper model ready');
 
@@ -136,7 +173,7 @@ async function startAudioCapture(streamId) {
             video: false
         });
 
-        audioContext = new AudioContext({ sampleRate: 16000 });
+        audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
 
         // Keep context from suspending
         if (keepAliveInterval) clearInterval(keepAliveInterval);
@@ -162,34 +199,47 @@ async function startAudioCapture(streamId) {
         source.connect(compressor);
         compressor.connect(gainNode);
 
-        await processAudio(gainNode);
+        await processAudio(gainNode, source);
     } catch (err) {
         console.error('Tab audio access error:', err);
     }
 }
 
 // Split audio into phrases by silence
-async function processAudio(audioNode) {
+async function processAudio(audioNode, rawNode) {
     try {
         await audioContext.audioWorklet.addModule('audio-processor.js');
-        const workletNode = new AudioWorkletNode(audioContext, 'whisper-audio-processor');
+        // Input 0: boosted audio for Whisper, input 1: raw audio for silence detection
+        const workletNode = new AudioWorkletNode(audioContext, 'whisper-audio-processor', {
+            numberOfInputs: 2,
+            channelCount: 1,
+            channelCountMode: 'explicit'
+        });
 
-        const SAMPLE_RATE = 16000;
         const MIN_SAMPLES = SAMPLE_RATE * 1.5;
         const MAX_SAMPLES = SAMPLE_RATE * 10.0;
         const SILENCE_THRESHOLD = SAMPLE_RATE * 0.7;
         const ABSOLUTE_MIN_VOLUME = 0.005;
+        // Chunk this much quieter than the phrase peak counts as a pause (music under speech)
+        const PAUSE_RATIO = 0.3;
 
         let audioChunks = [];
         let totalSamples = 0;
         let silenceSamples = 0;
         let isSpeaking = false;
+        let phrasePeak = 0;
+        let preRoll = null;
 
         workletNode.port.onmessage = (event) => {
-            const chunk = event.data;
-            const volume = getRMS(chunk);
+            // rms is measured before the compressor, which lifts noise above any threshold
+            const { audio: chunk, rms } = event.data;
 
-            if (volume >= ABSOLUTE_MIN_VOLUME) {
+            if (rms >= ABSOLUTE_MIN_VOLUME && rms >= phrasePeak * PAUSE_RATIO) {
+                // Keep the chunk before speech so the first syllable isn't cut
+                if (!isSpeaking && preRoll) {
+                    audioChunks.push(preRoll);
+                    totalSamples += preRoll.length;
+                }
                 isSpeaking = true;
                 silenceSamples = 0;
             } else {
@@ -199,6 +249,8 @@ async function processAudio(audioNode) {
             if (isSpeaking) {
                 audioChunks.push(chunk);
                 totalSamples += chunk.length;
+                phrasePeak = Math.max(phrasePeak, rms);
+                preRoll = null;
 
                 const isPhraseFinished = silenceSamples >= SILENCE_THRESHOLD && totalSamples >= MIN_SAMPLES;
                 const isBufferFull = totalSamples >= MAX_SAMPLES;
@@ -209,12 +261,16 @@ async function processAudio(audioNode) {
                     totalSamples = 0;
                     silenceSamples = 0;
                     isSpeaking = false;
+                    phrasePeak = 0;
                     enqueueTranscription(combined);
                 }
+            } else {
+                preRoll = chunk;
             }
         };
 
-        audioNode.connect(workletNode);
+        audioNode.connect(workletNode, 0, 0);
+        rawNode.connect(workletNode, 0, 1);
     } catch (e) {
         console.error('AudioWorklet init error:', e);
     }
@@ -237,62 +293,52 @@ function enqueueTranscription(audioData) {
     processQueue();
 }
 
-// Transcribe one phrase at a time
+// Transcribe one batch at a time
 async function processQueue() {
     if (isTranscribing || transcriptionQueue.length === 0) return;
     isTranscribing = true;
 
-    const audioData = transcriptionQueue.shift();
+    // Merge waiting phrases into one Whisper window to catch up
+    const parts = [transcriptionQueue.shift()];
+    let length = parts[0].length;
+    while (transcriptionQueue.length > 0 && length + transcriptionQueue[0].length <= WHISPER_WINDOW) {
+        length += transcriptionQueue[0].length;
+        parts.push(transcriptionQueue.shift());
+    }
+
     try {
-        await transcribeAndTranslate(audioData);
+        await transcribeAndTranslate(parts.length > 1 ? combineFloat32Arrays(parts) : parts[0]);
     } catch (err) {
         console.error('Transcription queue error:', err);
     } finally {
         isTranscribing = false;
-        if (transcriptionQueue.length > 0) {
-            setTimeout(processQueue, 50);
-        }
+        processQueue();
     }
 }
 
-let translateQueue = [];
-let isTranslating = false;
-
-// Translate one phrase at a time
-async function processTranslateQueue() {
-    if (isTranslating || translateQueue.length === 0) return;
-
-    isTranslating = true;
-    const task = translateQueue.shift();
-
-    try {
-        const translatedText = await freeTranslate(task.text);
-        if (targetTabId && translatedText) {
-            chrome.runtime.sendMessage({
-                action: 'RELAY_TRANSLATED',
-                tabId: targetTabId,
-                msgId: task.msgId,
-                translated: translatedText
-            });
-        }
-    } catch (err) {
-        console.error('Translation error:', err);
-    } finally {
-        setTimeout(() => {
-            isTranslating = false;
-            processTranslateQueue();
-        }, 50);
+// Translations run in parallel, rows are matched by msgId
+async function translateAndRelay(text, msgId) {
+    const translatedText = await freeTranslate(text);
+    if (targetTabId && translatedText) {
+        chrome.runtime.sendMessage({
+            action: 'RELAY_TRANSLATED',
+            tabId: targetTabId,
+            msgId: msgId,
+            translated: translatedText
+        });
     }
 }
 
-// Speech to text, then queue translation
+// Speech to text, then translate
 async function transcribeAndTranslate(audioData) {
     if (!transcriber) return;
 
     try {
         const result = await transcriber(audioData, {
             language: currentSettings.sourceLang,
-            task: 'transcribe'
+            task: 'transcribe',
+            // Stop hallucination loops early instead of running to 448 tokens
+            max_new_tokens: Math.min(440, 16 + Math.ceil(audioData.length / SAMPLE_RATE * 15))
         });
 
         const originalText = result.text.trim();
@@ -310,8 +356,7 @@ async function transcribeAndTranslate(audioData) {
             });
         }
 
-        translateQueue.push({ text: originalText, msgId: msgId });
-        processTranslateQueue();
+        translateAndRelay(originalText, msgId);
 
     } catch (error) {
         console.error('Processing error:', error);
@@ -323,7 +368,7 @@ async function freeTranslate(text) {
     if (!text || text.trim() === '') return '';
     const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${currentSettings.sourceLang}&tl=${currentSettings.targetLang}&dt=t&q=${encodeURIComponent(text)}`;
     try {
-        const response = await fetch(url);
+        const response = await fetch(url, { signal: AbortSignal.timeout(5000) });
         const data = await response.json();
         if (data && data[0] && Array.isArray(data[0])) {
             return data[0]

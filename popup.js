@@ -6,7 +6,8 @@ const targetLangSelect = document.getElementById('targetLang');
 
 // Load saved settings
 chrome.storage.local.get(['modelSize', 'sourceLang', 'targetLang'], (res) => {
-    if (res.modelSize) modelSelect.value = res.modelSize;
+    // 'medium' was replaced by turbo
+    if (res.modelSize) modelSelect.value = res.modelSize === 'medium' ? 'turbo' : res.modelSize;
     else modelSelect.value = 'base'; // Default
 
     if (res.sourceLang) sourceLangSelect.value = res.sourceLang;
